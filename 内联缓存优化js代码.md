@@ -198,4 +198,206 @@ public static class Program {
 
 使第二种调用代码同样可以工作的关键特性叫做“变异”，关于变异更多的信息请参考[MSDN文档](https://docs.microsoft.com/en-us/dotnet/standard/generics/covariance-and-contravariance?redirectedfrom=MSDN)。
 
-在编写代码的时候，编译器可以将原有代码中的类型定义替换为更具体或者更不具体的定义。在上面的例子中，由于string类型比object类型更为具体，所以接口
+在编写代码的时候，编译器可以将原有代码中的类型定义替换为更具体或者更不具体的定义。在上面的例子中，由于string类型比object类型更为具体，并且接口将T描述为out T，所以编译器明白在上面例子中的类型转换是安全的有效的。
+
+现在看下面的例子：
+```
+public class DerivedGenericProvider<T, T2> : GenericProvider<T>, ValueProvider<T2> {
+  public T2 T2Value;
+  
+  T2 ValueProvider<T2>.GetValue () {
+    return T2Value;
+  }
+}
+```
+
+调用代码如下：
+```
+public static class Program {
+  public static void Main () {
+    var provider = new DerivedGenericProvider<object, string> {
+      TValue = "object",
+      T2Value = "string"
+    };
+
+    ValueProvider<object> objectProvider = provider;
+    Console.WriteLine(objectProvider.GetValue());
+
+    ValueProvider<string> stringProvider = provider;
+    Console.WriteLine(stringProvider.GetValue());
+  }
+}
+```
+
+按照逻辑，唯一合理的输出是object和string，对吗？但是出乎意料的是，这段代码的输出结果是string和string。
+那么，现在，欢迎来到泛型接口变异的奇妙世界，在这里，一个类型可以多次实现同一个接口。（不合理）
+实现这种特性的唯一方法是在运行时决定调用哪个方法，那么我们就要搜索所有可用的方法来确定被调用的方法。现在我们知道为什么要使用内联缓存了，因为想要避免每次调用都进行一番查找，这样的查找实在是太慢了。
+
+## 没有内联缓存，代码运行的有多慢？
+
+为了解决这个疑问，我们需要看一些糟糕的测试结果。为了方便阅读可以[点击链接](https://github.com/sq/JSIL/blob/master/Tests/PerformanceTestCases/VariantGenericInterfaceMethodCalls.cs)。这是一个和可变类型交互的测试结果。
+```
+//// VariantGenericInterfaceMethodCalls.cs
+
+// C#
+Non-Variant Generic Interface, Non-Variant Call: 00141.00ms
+    Variant Generic Interface, Non-Variant Call: 00124.00ms
+
+// JavaScript, ICs disabled
+Non-Variant Generic Interface, Non-Variant Call: 00142.00ms
+    Variant Generic Interface, Non-Variant Call: 00267.00ms
+
+// JavaScript, ICs enabled
+Non-Variant Generic Interface, Non-Variant Call: 00140.00ms
+    Variant Generic Interface, Non-Variant Call: 00139.00ms
+```
+
+执行时间翻一倍似乎是一个可以接收的结果，但是使用内联缓存，这两种代码可以有同样快的的运行速度。
+
+下面是[关于重载方法的测试](https://github.com/sq/JSIL/blob/master/Tests/PerformanceTestCases/OverloadedMethodCalls.cs)。测试结果如下：
+```
+// C#
+Add: 00047.00ms
+Add Overloaded: 00047.00ms
+
+// JavaScript, ICs disabled
+Add: 00302.00ms
+Add Overloaded: 00766.00ms
+
+// JavaScript, ICs enabled
+Add: 00334.00ms
+Add Overloaded: 00319.00ms
+```
+
+以js实现的所有代码在测试结果中都反映出了比c#更慢的速度，这是因为js的运行时机制有时候不会生效。但是当我们使用内联缓存之后，可以看到，基本上已经消除了js中调用重载方法的开销。
+
+## 内联缓存是如何工作的？
+
+从核心上来讲，内联缓存的优化是基于以下两个关键现象：
+
+> 1.js的运行时机制倾向于在app开始运行之后进行代码优化。如果有需要，它会进行多次优化。
+
+> 2.我们可以将一个给定js对象上的方法替换成一个新的方法，之后任何对于这个方法的调用最终都是对于新方法的调用。
+
+从以上两个现象中，我们可以推出第三个现象：
+
+> 3.如果我们在运行时（自加）将一个给定js对象上的方法替换成新的方法，那么js的运行时机制也很可能会基于新的方法对代码进行优化。
+
+实际上，我们一开始生成的代码就是随需求变化的，第一次调用某个方法的时候使用了冷内联缓存，这个冷内联缓存中记录着调用了哪个方法，之后执行了一次正常而缓慢的调用。
+以下是一个重载方法调用测试案例：
+```
+function MethodSignature_CallStatic$0$2$inlineCache1(methodSource, name, ga, arg0, arg1) {
+  var methodKey = this.GetNamedKey(name, true);
+
+  this.$InlineCacheMiss(this, 'CallStatic', name, null, methodKey);
+
+  return methodSource[methodKey](
+    arg0,
+    arg1
+  );
+};
+```
+
+使用第一次函数调用时记录的信息，编译器能够编译出新的热内联缓存，这样的内联缓存仅供特定方法的调用。简化版本的编译后代码大致如下：
+```
+function MethodSignature_CallStatic$0$2$inlineCache2(methodSource, name, ga, arg0, arg1) {
+  switch (name) {
+    case "Add_Overloaded": 
+      return methodSource['Add_Overloaded$37,37=37'](
+        arg0,
+        arg1
+      );
+    
+    default: 
+      var methodKey = this.GetNamedKey(name, true);
+      this.$InlineCacheMiss(this, 'CallStatic', name, null, methodKey);
+      return methodSource[methodKey](
+        arg0,
+        arg1
+      );
+  }
+};
+```
+
+由于default语句的存在，在以未知函数名调用的时候代码仍能正常运行，并且会触发内联缓存的更新并适当增加内联缓存中的内容。
+一旦内联缓存变得过大，编译器会完全删除内联缓存，重新进行编译甚至再也不会为$InlineCacheMiss方法分配缓存。
+
+这种机制最大的优点在于，有新的内联缓存的代码相比于没有内联缓存的代码，可以进行更大程度上的内联和优化。
+如果调用者在调用过程中传常量"Add_Overloaded"，那么内联缓存会命中，编译器就可以很简单地识别出调用者想要调用某个代码块的内容并且讲其他部分的内容删除掉。
+从上面的例子中我们可以看到，热内联缓存给被调用方法分配了一个特定的或者混淆过的函数名。
+这就允许我们直接得到我们想要调用的方法，而不是在第一次运行js的时候依赖于编译器去找出目标方法。
+
+这种机制的好处还在于，它允许程序员在写代码的时候可以有意识地对代码进行优化。
+$InlineCacheMiss方法更新了内联缓存的记录数据，并且在必需的时候重新编译代码。下面看一个例子：（不准确）
+```
+JSIL.MethodSignature.prototype.$InlineCacheMiss = function (target, callMethodName, name, typeId, methodKey) {
+  if (!this.useInlineCache)
+    return;
+
+  // FIXME: This might be too small.
+  var inlineCacheCapacity = 3;
+  var numEntries = this.inlineCacheEntries.length | 0;
+
+  if (numEntries >= inlineCacheCapacity) {
+  // 一旦内联缓存过大，我们就将整个过程重新转换为简单的函数调用
+  // 这很重要，因为如果jit能够将被调用函数内联起来（这时条件就无所谓了），内联缓存将是唯一一个大的优化
+  // 内联缓存过大会阻止代码内联，在那时，代码不会很快也没有发挥内联缓存应有的作用
+    this.inlineCacheEntries = null;
+    this.useInlineCache = false;
+
+    this.$RecompileInlineCache(target, callMethodName);
+  } else {
+    for (var i = 0; i < numEntries; i++) {
+      var entry = this.inlineCacheEntries[i];
+
+      // Our caller is an expired inline cache function.
+      if (entry.equals(name, typeId, methodKey)) {
+        // Some bugs cause this to happen over and over so perf sucks.
+        // JSIL.RuntimeError("Inline cache miss w/ pending recompile.");
+        return;
+      }
+    }
+
+    // If we had a cache miss and the target doesn't have an entry, add it and recompile.
+    var newEntry = new JSIL.MethodSignatureInlineCacheEntry(name, typeId, methodKey);
+    this.inlineCacheEntries.push(newEntry);
+    this.$RecompileInlineCache(target, callMethodName);
+  }
+};
+```
+
+我们看到，因为一个过大的内联缓存并不利于代码的内联，并且在内联失效时切换语句有很高的代价，所以当内联缓存生成的代码有太多入口语句的时候，我们尽量使内联缓存失效。
+
+实际上就是这样，V8引擎决定是否使用内联优化取决于源代码中字符的数量而不是方法的复杂度，这里要注意咯~
+
+另一个保持内联缓存体积小是合理的原因是，有些JIT（即时编译器）对于重新编译次数过多的方法会完全禁止优化，所以如果我们一直在更新内联缓存，那么这段内联缓存匹配的代码可能最终会完全停止优化操作。
+
+而对于缓存未命中的处理，同样需要处理那种方法实际已经存在在缓存中但是命中失效了的情况。由于内联缓存的查找是以变量的形式入栈的，所以当缓存失效或者重新编译的时候，如果上一个版本的内联缓存仍在使用，那么这种情况就会发生。
+这意味着我们最终要付出的代价是查找内联缓存并且经过缓慢的方法调用路径的代价，但不会做额外毫无意义的重新编译。
+
+如果缓存失效的结果是对于内联缓存的更新或者禁用，那么我们可以通过调用$RecompileInlineCache方法来重新唤起编译过程，示例代码如下：
+```
+JSIL.MethodSignature.prototype.$RecompileInlineCache = function (target, callMethodName) {
+  var cacheKey = callMethodName + "$" + this.GetUnnamedKey(true);  
+  var newFunction = this.$MakeInlineCacheBody(callMethodName, target.methodKey || null);
+
+  if (JSIL.MethodSignature.$CallMethodCache) {
+    JSIL.MethodSignature.$CallMethodCache[cacheKey] = newFunction;
+  }
+
+  // HACK
+  var propertyName = this.isInterfaceSignature
+    ? "Call"
+    : callMethodName;
+
+  // Once we've recompiled the inline cache, overwrite the old one on the target.
+  // Note that this is not 'this' because for interface methods, the IC is managed
+  //  by their signature but lives on the interface method object instead.
+  JSIL.SetValueProperty(target, propertyName, newFunction); 
+};
+```
+
+这个方法很简单，主要负责唤起编译内联缓存的方法，更新编译缓存，然后找出原有内联缓存地址并进行替换（通过代码底部的SetValueProperty方法）。替换内联缓存可能导致调用内联缓存的代码需要重新编译，但是在这些操作完成之后，JIT（即时编译器）将会内联和优化使用到的代码。
+
+## 为什么不用Function.call或者Function.apply方法进行调用？
+
