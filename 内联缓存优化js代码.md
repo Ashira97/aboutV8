@@ -138,4 +138,64 @@ function Test () {
   var b = int_Divide_int_int(5, 2);
 }
 ```
-这不是什么好的解决方法，但它至少解决了问题。但是这个方法还有一个缺点。
+
+虽然能用，但这不是什么好的解决方法，因为这个方法允许了静态类型的语言，在运行时操作变量类型和方法，这很奇怪。
+
+c#中有个概念叫做“泛型类型”。在定义一个抽象泛型类型给一个变量的时候，这个变量的真实类型可能有很多种情况，之后在代码中将泛型类型和某些真实类型结合，来得到一个可用的真实类型。举个栗子，泛型类型list<T>结合了类型参数int产生了真实类型list<int>，这个类型是一个包含很多int类型数据的列表。这一切都是静态运行的，不会有任何的运行时类型检查，数组也会高效运行。一切看起来都很棒~~
+  
+然而
+
+c#中还有个概念叫做“反射”。反射就意味着你必须在运行时检查变量类型、检查方法和值，然后操作它们。在.NET中，你甚至可以在运行时创造一个新的真实泛型类型，然后创建一个它的实例。当你做这样操作的时候，.NET的JIT（即时编译器）通过为这个新的类型重新编译一段代码来满足你的请求，这样就可以使用这个新的类型了。
+
+但是这个时候，我们就发现，混淆生成一系列javascript函数的名字的想法可能并不奏效了。走到这里，我们发现，存在一些类似上述描述到的情景，能写一个正确地处理所有情况的编译器并不容易。那么我们应该怎么办？
+
+## 使用内联缓存。但为什么选择它？
+
+现在，放弃之前的观点，我们发现有些操作必须在运行时才能决定，因为即使对于c#这样的静态类型语言而言，这些操作的确定也是在运行时阶段确定的。确定这样的观点之后，我们就得想想如何设计代码来实现这样的需求。
+
+在此之前，我们依靠编译器完成一系列变量提升等优化，现在在javascript中，我们得自己高效地实现这一系列操作了。虽然这种情况并不常见，但是c#中的常用的特性-接口-有时候也需要这种神奇的操作。下面我们来写一个简单的c#接口：
+```
+public interface ValueProvider<out T> {
+  T GetValue();
+}
+
+public class GenericProvider<T> : ValueProvider<T> {
+  public T TValue;
+  
+  T ValueProvider<T>.GetValue () {
+    return TValue;
+  }
+}
+```
+
+调用代码如下：
+```
+public static class Program {
+  public static void Main () {
+    var provider = new GenericProvider<string> {
+      TValue = "string"
+    };
+    
+    ValueProvider<string> stringProvider = provider;
+    Console.WriteLine(stringProvider.GetValue()); // prints "string"
+  }
+}
+```
+
+但下面的调用代码同样也能得到相同的结果：
+```
+public static class Program {
+  public static void Main () {
+    var provider = new GenericProvider<string> {
+      TValue = "string"
+    };
+    
+    ValueProvider<object> objectProvider = provider;
+    Console.WriteLine(objectProvider.GetValue()); // prints "string"
+  }
+}
+```
+
+使第二种调用代码同样可以工作的关键特性叫做“变异”，关于变异更多的信息请参考[MSDN文档](https://docs.microsoft.com/en-us/dotnet/standard/generics/covariance-and-contravariance?redirectedfrom=MSDN)。
+
+在编写代码的时候，编译器可以将原有代码中的类型定义替换为更具体或者更不具体的定义。在上面的例子中，由于string类型比object类型更为具体，所以接口
