@@ -1,5 +1,7 @@
 # 使用内联缓存技术动态优化javascript代码（译）
 
+原文地址在[这里](https://github.com/sq/JSIL/wiki/Optimizing-dynamic-JavaScript-with-inline-caches)
+
 ## 使用内联缓存优化js代码
 
 在javascript中使用内联缓存，会带来无尽的乐趣和收获~
